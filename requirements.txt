@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 py-gemini-watermark-remover==0.2.9
 opencv-python-headless
 numpy
+yt-dlp
