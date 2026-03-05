@@ -1,6 +1,6 @@
 """
 Gemini Watermark Remover + Meta AI Video Downloader Bot
-- Send a Gemini image → get back watermark-free version (all resolutions including 9:16 portrait)
+- Send a Gemini image → get back watermark-free version (all resolutions including padded 9:16)
 - Send a meta.ai/media-share URL → get back the downloaded video
 """
 
@@ -34,16 +34,14 @@ ALPHA_MAP_URLS = {
 
 def load_alpha_map(size: int) -> np.ndarray:
     url = ALPHA_MAP_URLS[size]
-    log.info(f"Downloading alpha map {size}px from {url}")
+    log.info(f"Downloading alpha map {size}px...")
     with urllib.request.urlopen(url) as r:
         data = r.read()
     arr  = np.frombuffer(data, dtype=np.uint8)
     img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"Failed to decode alpha map {size}px")
-    alpha = np.max(img.astype(np.float32), axis=2) / 255.0
-    log.info(f"Alpha map {size}px loaded: {alpha.shape}")
-    return alpha
+    return np.max(img.astype(np.float32), axis=2) / 255.0
 
 log.info("Loading alpha maps...")
 ALPHA_48 = load_alpha_map(48)
@@ -52,22 +50,51 @@ log.info("Alpha maps ready.")
 
 # ─── WATERMARK REMOVAL ────────────────────────────────────────────────────────
 
-def get_watermark_config(width: int, height: int) -> dict:
-    """Use 96x96 ONLY when BOTH dimensions > 1024, else 48x48."""
-    if width > 1024 and height > 1024:
-        return {"size": 96, "margin": 64}
-    return {"size": 48, "margin": 32}
+def detect_content_bounds(image: np.ndarray) -> tuple[int, int]:
+    """
+    Detect top/bottom of actual content, ignoring black padding bars
+    that Gemini adds to portrait images.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    h    = image.shape[0]
+
+    content_bottom = h - 1
+    for y in range(h - 1, 0, -1):
+        if gray[y].max() > 10:
+            content_bottom = y
+            break
+
+    content_top = 0
+    for y in range(0, h):
+        if gray[y].max() > 10:
+            content_top = y
+            break
+
+    return content_top, content_bottom
 
 
 def remove_gemini_watermark(image: np.ndarray) -> np.ndarray:
-    h, w  = image.shape[:2]
-    cfg   = get_watermark_config(w, h)
-    size  = cfg["size"]
-    margin = cfg["margin"]
+    h, w = image.shape[:2]
+
+    # Detect actual content area (accounts for black padding)
+    content_top, content_bottom = detect_content_bounds(image)
+    content_h = content_bottom - content_top
+
+    log.info(f"Image: {w}x{h}, content rows: {content_top}→{content_bottom} (h={content_h})")
+
+    # Choose watermark size based on content dimensions
+    if w > 1024 and content_h > 1024:
+        size, margin = 96, 64
+    else:
+        size, margin = 48, 32
+
     alpha_map = ALPHA_48 if size == 48 else ALPHA_96
 
-    x = w - margin - size
-    y = h - margin - size
+    # Position relative to content bottom, not image bottom
+    x   = w - margin - size
+    y_wm = content_bottom - margin - size
+
+    log.info(f"Watermark: {size}px at ({x}, {y_wm})")
 
     ALPHA_THRESHOLD = 0.002
     MAX_ALPHA       = 0.99
@@ -75,15 +102,13 @@ def remove_gemini_watermark(image: np.ndarray) -> np.ndarray:
 
     result = image.astype(np.float32).copy()
 
-    # Vectorised removal — much faster than nested Python loops
-    rows, cols = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
-    a = np.clip(alpha_map, 0, MAX_ALPHA)
+    a    = np.clip(alpha_map, 0, MAX_ALPHA)
     mask = a >= ALPHA_THRESHOLD
 
     for c in range(3):
-        patch = result[y:y+size, x:x+size, c]
+        patch = result[y_wm:y_wm+size, x:x+size, c]
         orig  = np.where(mask, (patch - a * LOGO_VALUE) / (1.0 - a), patch)
-        result[y:y+size, x:x+size, c] = np.clip(orig, 0, 255)
+        result[y_wm:y_wm+size, x:x+size, c] = np.clip(orig, 0, 255)
 
     return result.astype(np.uint8)
 
