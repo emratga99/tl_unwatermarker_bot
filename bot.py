@@ -1,6 +1,6 @@
 """
 Gemini Watermark Remover + Meta AI Video Downloader Bot
-- Send a Gemini image → get back watermark-free version (all resolutions including padded 9:16)
+- Send a Gemini image → get back watermark-free version
 - Send a meta.ai/media-share URL → get back the downloaded video
 """
 
@@ -25,6 +25,19 @@ ALLOWED_CHAT_ID = int(os.environ["CHAT_ID"])
 
 META_AI_URL_PATTERN = re.compile(r"https?://(?:www\.)?meta\.ai/media-share/\S+")
 
+# ─── TUNABLE OFFSET VARIABLES ─────────────────────────────────────────────────
+# If the removal patch is in the wrong place, adjust these:
+#   OFFSET_X  — shift patch left (negative) or right (positive)
+#   OFFSET_Y  — shift patch up (negative) or down (positive)
+#
+# Gemini places watermark at bottom-right of the CONTENT area (ignoring black padding)
+# Actual measured margins from content edge: ~16px right, ~15px bottom
+
+MARGIN_RIGHT  = 16   # pixels from right edge of content to right edge of watermark
+MARGIN_BOTTOM = 15   # pixels from bottom edge of content to bottom edge of watermark
+OFFSET_X      = 0    # fine-tune horizontal position
+OFFSET_Y      = 0    # fine-tune vertical position
+
 # ─── ALPHA MAP LOADING ────────────────────────────────────────────────────────
 
 ALPHA_MAP_URLS = {
@@ -37,8 +50,8 @@ def load_alpha_map(size: int) -> np.ndarray:
     log.info(f"Downloading alpha map {size}px...")
     with urllib.request.urlopen(url) as r:
         data = r.read()
-    arr  = np.frombuffer(data, dtype=np.uint8)
-    img  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"Failed to decode alpha map {size}px")
     return np.max(img.astype(np.float32), axis=2) / 255.0
@@ -50,64 +63,46 @@ log.info("Alpha maps ready.")
 
 # ─── WATERMARK REMOVAL ────────────────────────────────────────────────────────
 
-def detect_content_bounds(image: np.ndarray) -> tuple[int, int]:
-    """
-    Detect top/bottom of actual content, ignoring black padding bars
-    that Gemini adds to portrait images.
-    """
+def get_content_bottom(image: np.ndarray) -> int:
+    """Find last non-black row to handle Gemini's bottom padding."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     h    = image.shape[0]
-
-    content_bottom = h - 1
     for y in range(h - 1, 0, -1):
         if gray[y].max() > 10:
-            content_bottom = y
-            break
-
-    content_top = 0
-    for y in range(0, h):
-        if gray[y].max() > 10:
-            content_top = y
-            break
-
-    return content_top, content_bottom
+            return y
+    return h - 1
 
 
 def remove_gemini_watermark(image: np.ndarray) -> np.ndarray:
-    h, w = image.shape[:2]
+    h, w           = image.shape[:2]
+    content_bottom = get_content_bottom(image)
+    content_h      = content_bottom  # approximate content height
 
-    # Detect actual content area (accounts for black padding)
-    content_top, content_bottom = detect_content_bounds(image)
-    content_h = content_bottom - content_top
-
-    log.info(f"Image: {w}x{h}, content rows: {content_top}→{content_bottom} (h={content_h})")
-
-    # Choose watermark size based on content dimensions
+    # Choose watermark size: 96px when both dims > 1024, else 48px
     if w > 1024 and content_h > 1024:
-        size, margin = 96, 64
+        size = 96
     else:
-        size, margin = 48, 32
+        size = 48
 
     alpha_map = ALPHA_48 if size == 48 else ALPHA_96
 
-    # Position relative to content bottom, not image bottom
-    x   = w - margin - size
-    y_wm = content_bottom - margin - size
+    # Watermark position with tunable offsets
+    x   = w - MARGIN_RIGHT - size + OFFSET_X
+    y_wm = content_bottom - MARGIN_BOTTOM - size + OFFSET_Y
 
-    log.info(f"Watermark: {size}px at ({x}, {y_wm})")
+    log.info(f"Image {w}x{h}, content_bottom={content_bottom}, {size}px watermark at ({x}, {y_wm})")
 
     ALPHA_THRESHOLD = 0.002
     MAX_ALPHA       = 0.99
     LOGO_VALUE      = 255.0
 
     result = image.astype(np.float32).copy()
-
-    a    = np.clip(alpha_map, 0, MAX_ALPHA)
-    mask = a >= ALPHA_THRESHOLD
+    a      = np.clip(alpha_map, 0, MAX_ALPHA)
+    mask   = a >= ALPHA_THRESHOLD
 
     for c in range(3):
-        patch = result[y_wm:y_wm+size, x:x+size, c]
-        orig  = np.where(mask, (patch - a * LOGO_VALUE) / (1.0 - a), patch)
+        patch  = result[y_wm:y_wm+size, x:x+size, c]
+        orig   = np.where(mask, (patch - a * LOGO_VALUE) / (1.0 - a), patch)
         result[y_wm:y_wm+size, x:x+size, c] = np.clip(orig, 0, 255)
 
     return result.astype(np.uint8)
@@ -185,18 +180,15 @@ async def handle_text(update: Update, context):
         try:
             result = subprocess.run(
                 [
-                    "yt-dlp",
-                    "--no-playlist",
+                    "yt-dlp", "--no-playlist",
                     "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                     "--merge-output-format", "mp4",
-                    "-o", output_template,
-                    url,
+                    "-o", output_template, url,
                 ],
                 capture_output=True, text=True, timeout=120,
             )
 
             if result.returncode != 0:
-                log.error(f"yt-dlp error: {result.stderr}")
                 await status.edit_text(f"❌ Download failed:\n{result.stderr[-500:]}")
                 return
 
@@ -207,7 +199,6 @@ async def handle_text(update: Update, context):
 
             video_path   = videos[0]
             file_size_mb = video_path.stat().st_size / (1024 * 1024)
-
             await status.delete()
 
             if file_size_mb > 50:
@@ -218,15 +209,13 @@ async def handle_text(update: Update, context):
 
             with open(video_path, "rb") as f:
                 await update.message.reply_document(
-                    document=f,
-                    filename=video_path.name,
+                    document=f, filename=video_path.name,
                     caption=f"✅ Downloaded! ({file_size_mb:.1f}MB)",
                 )
 
         except subprocess.TimeoutExpired:
             await status.edit_text("❌ Download timed out (>2 min). Try again.")
         except Exception as e:
-            log.error(f"Video download failed: {e}")
             await status.edit_text(f"❌ Error: {e}")
 
 
