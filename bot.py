@@ -35,8 +35,8 @@ META_AI_URL_PATTERN = re.compile(r"https?://(?:www\.)?meta\.ai/media-share/\S+")
 
 MARGIN_RIGHT  = 16   # pixels from right edge of content to right edge of watermark
 MARGIN_BOTTOM = 15   # pixels from bottom edge of content to bottom edge of watermark
-OFFSET_X      = 0    # fine-tune horizontal position
-OFFSET_Y      = 0    # fine-tune vertical position
+OFFSET_X      = 44    # fine-tune horizontal position
+OFFSET_Y      = 44    # fine-tune vertical position
 
 # ─── ALPHA MAP LOADING ────────────────────────────────────────────────────────
 
