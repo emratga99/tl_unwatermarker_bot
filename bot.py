@@ -55,8 +55,8 @@ log.info("Alpha maps ready.")
 def get_watermark_config(width: int, height: int) -> dict:
     """Use 96x96 ONLY when BOTH dimensions > 1024, else 48x48."""
     if width > 1024 and height > 1024:
-        return {"size": 96, "margin": 62}
-    return {"size": 48, "margin": 32}
+        return {"size": 96, "margin": 61}
+    return {"size": 48, "margin": 30}
 
 
 def remove_gemini_watermark(image: np.ndarray) -> np.ndarray:
